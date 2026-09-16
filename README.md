@@ -2,6 +2,51 @@
 twiboot is a simple/small bootloader for AVR MCUs written in C. It uses the integrated TWI or USI peripheral of the controller to implement a I2C slave.
 It was originally created to update I2C controlled BLMCs (Brushless Motor Controller) without an AVR ISP adapter.
 
+## This fork (split-flap project) ##
+This repository is a lightly patched fork of upstream twiboot, created for the
+[split-flap project](https://github.com/Tortoc/split-flap) to update its ATmega328p "Unit" boards
+over I2C. It is based on unmodified upstream commit
+[`559a403`](https://github.com/orempel/twiboot/commit/559a403836e8d91a2d5b962e9541af679150b7a9)
+(2021-02-20).
+
+**How much is actually different:** diffed directly against that upstream commit
+(898 lines) against this fork's `main.c` (1037 lines) - roughly 5% of the file's functional code
+(the rest, including the entire TWI/I2C protocol below, is byte-for-byte identical to upstream).
+About half of the added lines are a documentation header at the top of `main.c` explaining the
+changes in place; see that header for the full, line-referenced rationale behind each one, or the
+commit history of this repository for each change as its own commit. Summary:
+
+1. **Dynamic I2C address via DIP switches** (~20 new lines + renaming `TWI_ADDRESS` to
+   `TWI_ADDRESS_BASE`): instead of a fixed compile-time slave address, `main()` reads the same
+   6 address-jumper pins the application firmware (`Unit.ino`) already reads and adds that to
+   `TWI_ADDRESS_BASE`. This lets one compiled bootloader image be flashed onto every unit -
+   jumper changes take effect immediately, with no per-unit bootloader rebuild/reflash.
+2. **Hardware-matched timing** (2 lines): `F_CPU` changed from upstream's 8MHz default to this
+   project's actual 16MHz crystal, with the idle-timer interval adjusted accordingly (25ms ->
+   12ms) to avoid a counter overflow at the higher clock.
+3. **EEPROM update-in-progress marker** (~30 lines): a dedicated EEPROM byte now gates whether
+   the bootloader is allowed to boot into the application at all. The application-update code on
+   the ESPMaster side arms this marker before writing any flash page and only clears it once the
+   full image is written and verified - so an interrupted update can never leave the unit
+   auto-booting into a half-written, inconsistent application.
+4. **Idle-timeout re-arm fix** (1 line): unmodified upstream disables the ~1000ms idle-boot
+   countdown the moment any real bootloader command arrives, and never re-enables it - so a
+   master that abandons a session early (crash, lost network, wrong target) left the unit stuck
+   in the bootloader indefinitely, needing a manual power cycle. Changed to re-arm the countdown
+   on every command instead, making it a rolling idle timer that always recovers on its own.
+
+**This fork's own version:** upstream tags releases as MAJOR.MINOR only (v1.0, v1.1, v1.2, v2.0,
+v2.1, v3.0 on GitHub), and this fork's base commit already carries `"TWIBOOT v3.2"` in
+`VERSION_STRING` (5 commits past the v3.0 tag, version bumped in source ahead of a formal tag).
+Continuing that same scheme forward through the four changes above (each new capability a MINOR
+bump, the bugfix a MINOR bump as well since upstream has no separate patch level): v3.2 -> **v3.3**
+(dynamic addressing) -> **v3.4** (EEPROM update marker) -> **v3.5** (idle-timeout fix). Unlike the
+earlier state of this fork, this version IS now reported over I2C - `Show bootloader version`
+returns `"SF-TWIBOOT v3.5"`, not upstream's own string, since a full ISP reflash of every deployed
+unit's bootloader (needed to pick up this string - there is no OTA path for the bootloader itself,
+by design) ended up happening anyway for other reasons. Everything else - chip info, flash/EEPROM
+read/write, application start, clockstretching - is exactly the upstream protocol.
+
 twiboot acts as a slave device on a TWI/I2C bus and allows reading/writing of the internal flash memory.
 As a compile time option (EEPROM_SUPPORT) twiboot also allows reading/writing of the whole internal EEPROM memory.
 The bootloader is not able to update itself (only application flash memory region accessible).
