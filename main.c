@@ -16,6 +16,25 @@
  *   Free Software Foundation, Inc.,                                       *
  *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
  ***************************************************************************/
+/***************************************************************************
+ * MODIFIED FORK - split-flap project (https://github.com/Tortoc/split-flap)
+ *
+ * Based on unmodified upstream https://github.com/orempel/twiboot
+ * commit 559a403836e8d91a2d5b962e9541af679150b7a9 (2021-02-20).
+ *
+ * Change: the TWI/I2C address is no longer a fixed compile-time value.
+ * Instead, main() reads the same 4 DIP-switch address pins (D3-D6 = PD3-PD6)
+ * that Unit.ino's getaddress() already reads, and adds that to
+ * TWI_ADDRESS_BASE. This keeps a single compiled bootloader image usable on
+ * every unit, and makes DIP-switch/jumper changes take effect immediately
+ * for firmware updates too, without needing a per-unit bootloader reflash.
+ * See Unit/BOOTLOADER_SETUP.md and the "twiboot patchen" section of the
+ * project's implementation plan for the full rationale.
+ *
+ * Everything else in this file is unmodified upstream code. This file
+ * remains licensed under GPL-2.0 (see LICENSE in this directory), as
+ * required for redistributing a modified version.
+ ***************************************************************************/
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/boot.h>
@@ -33,13 +52,35 @@
 #define VIRTUAL_BOOT_SECTION    0
 #endif
 
-#ifndef TWI_ADDRESS
-#define TWI_ADDRESS             0x29
+#ifndef TWI_ADDRESS_BASE
+#define TWI_ADDRESS_BASE        0x29
 #endif
+/* Actual TWI address = TWI_ADDRESS_BASE + (DIP switch reading), computed at runtime in main() */
 
-#define F_CPU                   8000000ULL
+/* 16MHz, NOT twiboot's own upstream default of 8MHz: this project's hardware (bare ATmega328P
+ * on the fae-pcb, https://github.com/codingcatgirl/split-flap-fae-pcb) has a real external
+ * 16MHz crystal (Y2 in the schematic), matching nano.build.f_cpu=16000000L in Arduino's own
+ * boards.txt - what Unit.ino and the whole Arduino core/Stepper library are compiled against.
+ * Must be paired with the Makefile's AVRDUDE_FUSES (lfuse=0xFF for external crystal, hfuse=0xDA
+ * matching this hardware's actual, factory-programmed 1024-word boot section / BOOTLOADER_START
+ * below), not twiboot's own upstream example fuses. Getting either the clock source or the boot
+ * section size/address wrong silently runs the chip wrong or jumps to a boot address the actual
+ * fuses don't point to - no error message, it just doesn't work. Root-caused by testing against
+ * a pristine, never-touched unit's actual factory fuses (2026-08-10): the stepper motor only
+ * moved again once F_CPU/lfuse/hfuse/BOOTLOADER_START here all matched that hardware exactly -
+ * see Unit/BOOTLOADER_SETUP.md and the Makefile's atmega328p section for the full story. */
+#define F_CPU                   16000000ULL
+/* util/delay.h's _delay_us()/_delay_ms() calibrate against F_CPU, so this include must come
+ * after F_CPU is defined above - including it earlier silently defaults to the wrong clock
+ * speed (1MHz) and produces incorrect (too short) delays. */
+#include <util/delay.h>
+
 #define TIMER_DIVISOR           1024
-#define TIMER_IRQFREQ_MS        25
+/* Upstream uses 25ms here, sized so a single Timer0 overflow period fits the 8-bit TCNT0
+ * preload at F_CPU=8MHz (8MHz/1024/1000*25 = ~195 ticks, fits under 255). At our F_CPU=16MHz
+ * that would be ~390 ticks - overflows uint8_t (see TCNT0 = 0xFF - TIMER_MSEC2TICKS(...) below).
+ * 12ms keeps the same margin at 16MHz (16MHz/1024/1000*12 = ~188 ticks). */
+#define TIMER_IRQFREQ_MS        12
 #define TIMEOUT_MS              1000
 
 #define TIMER_MSEC2TICKS(x)     ((x * F_CPU) / (TIMER_DIVISOR * 1000ULL))
@@ -620,14 +661,14 @@ static void usi_statemachine(uint8_t usisr)
         bcnt = 0;
 
         /* SLA+W received -> send ACK */
-        if (data == ((TWI_ADDRESS<<1) | 0x00))
+        if (data == ((TWI_ADDRESS_BASE<<1) | 0x00))
         {
             LED_RT_ON();
             usi_state = USI_STATE_SLAW_ACK | USI_WAIT_FOR_ACK | USI_ENABLE_SDA_OUTPUT | USI_ENABLE_SCL_HOLD;
             USIDR = 0x00;
         }
         /* SLA+R received -> send ACK */
-        else if (data == ((TWI_ADDRESS<<1) | 0x01))
+        else if (data == ((TWI_ADDRESS_BASE<<1) | 0x01))
         {
             LED_RT_ON();
             usi_state = USI_STATE_SLAR_ACK | USI_WAIT_FOR_ACK | USI_ENABLE_SDA_OUTPUT | USI_ENABLE_SCL_HOLD;
@@ -827,8 +868,24 @@ int main(void)
 #endif
 
 #if defined (TWCR)
+    /* Read the address DIP switches (same pins as Unit.ino's getaddress():
+     * D3-D6 = PD3-PD6, switch ON = pulled to GND = bit set), so the
+     * bootloader's I2C address always matches whatever the app would use -
+     * one compiled image for every unit, jumper changes apply immediately
+     * without a bootloader reflash. */
+    DDRD &= ~((1<<PD3) | (1<<PD4) | (1<<PD5) | (1<<PD6));  /* inputs */
+    PORTD |= (1<<PD3) | (1<<PD4) | (1<<PD5) | (1<<PD6);    /* enable pull-ups */
+    _delay_us(50); /* let pull-ups settle */
+
+    uint8_t pins = PIND;
+    uint8_t dipAddress = 0;
+    if (!(pins & (1<<PD3))) dipAddress |= 1;
+    if (!(pins & (1<<PD4))) dipAddress |= 2;
+    if (!(pins & (1<<PD5))) dipAddress |= 4;
+    if (!(pins & (1<<PD6))) dipAddress |= 8;
+
     /* TWI init: set address, auto ACKs */
-    TWAR = (TWI_ADDRESS<<1);
+    TWAR = ((TWI_ADDRESS_BASE + dipAddress) << 1);
     TWCR = (1<<TWEA) | (1<<TWEN);
 #elif defined (USICR)
     USI_PIN_INIT();
